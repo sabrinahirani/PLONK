@@ -1,6 +1,5 @@
 use ark_bn254::Fr;
 
-/// Supported gate types in the arithmetic circuit
 #[derive(Clone, Debug)]
 pub enum GateType {
     Input,
@@ -10,25 +9,20 @@ pub enum GateType {
     Output,
 }
 
-/// A gate in the arithmetic circuit
 #[derive(Clone, Debug)]
 pub struct Gate {
     pub id: usize,
     pub gate_type: GateType,
     pub left: Option<usize>,
     pub right: Option<usize>,
-    pub owner: Option<usize>, // Only for input wires (optional use)
 }
 
-/// A circuit consists of a list of gates and synthesized data
 #[derive(Clone, Debug)]
 pub struct Circuit {
     pub gates: Vec<Gate>,
 
-    // Optional: witness values assigned to each gate after evaluation
     pub witness: Vec<Fr>,
 
-    // R1CS-like vectors for a(X), b(X), c(X)
     pub a_vec: Vec<Fr>,
     pub b_vec: Vec<Fr>,
     pub c_vec: Vec<Fr>,
@@ -45,7 +39,6 @@ impl Circuit {
         }
     }
 
-    /// Adds a gate to the circuit and returns its assigned ID
     pub fn add_gate(
         &mut self,
         gate_type: GateType,
@@ -64,16 +57,6 @@ impl Circuit {
         id
     }
 
-    /// Retrieves input wires for a given party (by owner ID)
-    pub fn input_wires_by_owner(&self, owner: usize) -> Vec<usize> {
-        self.gates
-            .iter()
-            .filter(|g| matches!(g.gate_type, GateType::Input) && g.owner == Some(owner))
-            .map(|g| g.id)
-            .collect()
-    }
-
-    /// Retrieves all output wires in the circuit
     pub fn output_wires(&self) -> Vec<usize> {
         self.gates
             .iter()
@@ -82,7 +65,6 @@ impl Circuit {
             .collect()
     }
 
-    /// Assigns a witness vector (i.e., values for each wire)
     pub fn assign_witness(&mut self, witness: Vec<Fr>) {
         assert_eq!(
             witness.len(),
@@ -92,7 +74,6 @@ impl Circuit {
         self.witness = witness;
     }
 
-    /// Synthesizes a_vec, b_vec, c_vec from the gates and witness
     pub fn synthesize_r1cs(&mut self) {
         let n = self.gates.len();
         self.a_vec = vec![Fr::zero(); n];
