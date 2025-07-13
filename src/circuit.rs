@@ -1,7 +1,8 @@
-use ark_ff::Field;
+use ark_ff::{Field, FftField, Zero};
 use ark_poly::univariate::DensePolynomial;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_poly::DenseUVPolynomial;
+use ark_poly::polynomial::Polynomial;
 
 use std::collections::HashMap;
 
@@ -75,10 +76,8 @@ pub struct PermutationLayout {
 }
 
 impl PermutationLayout {
-    // TODO
     /// Computes the sigma permutation mapping for the permutation argument.
     pub fn compute_sigma_mapping(&self, num_rows: usize) -> Vec<usize> {
-
         // constructs all possible wire positions in the circuit in linearized order
         let mut flat_positions = Vec::with_capacity(3 * num_rows);
         for row in 0..num_rows {
@@ -93,8 +92,10 @@ impl PermutationLayout {
             position_to_index.insert(*pos, i);
         }
 
-        // update sigma by cycling through wire positions
-        let mut sigma = vec![0usize; 3 * num_rows];
+        // Initialize sigma as identity mapping
+        let mut sigma: Vec<usize> = (0..3 * num_rows).collect();
+
+        // Overwrite only the positions involved in cycles
         for (_var, uses) in self.positions.iter() {
             let n = uses.len();
             for i in 0..n {
@@ -106,6 +107,7 @@ impl PermutationLayout {
             }
         }
 
+        // sigma is now guaranteed to have length 3 * num_rows and include all positions
         sigma
     }
 }
@@ -123,8 +125,6 @@ pub struct WitnessTable<F: Field> {
     pub c_col: Vec<F>,
     pub q_add: Vec<F>,
     pub q_mul: Vec<F>,
-    pub q_add_poly: DensePolynomial<F>, // selector polynomial for +
-    pub q_mul_poly: DensePolynomial<F>, // selector polynomial for *
 }
 
 impl<F: Field> WitnessTable<F> {
@@ -213,7 +213,7 @@ impl<F: Field + ark_ff::FftField> CircuitBuilder<F> {
     }
 
     /// Generates the witness table.
-    pub fn generate_witness_table(&self) -> WitnessTable<F> {
+    pub fn generate_witness_table(&self, domain_size: usize) -> WitnessTable<F> {
         let mut a_col = Vec::new();
         let mut b_col = Vec::new();
         let mut c_col = Vec::new();
@@ -241,11 +241,16 @@ impl<F: Field + ark_ff::FftField> CircuitBuilder<F> {
             }
         }
 
-        // interpolate to generate selector polynomials
-        let q_add_poly = interpolate_selector::<F>(&q_add);
-        let q_mul_poly = interpolate_selector::<F>(&q_mul);
+        // Pad all columns to domain_size with zeros
+        while a_col.len() < domain_size {
+            a_col.push(F::zero());
+            b_col.push(F::zero());
+            c_col.push(F::zero());
+            q_add.push(F::zero());
+            q_mul.push(F::zero());
+        }
 
-        WitnessTable { a_col, b_col, c_col, q_add, q_mul, q_add_poly, q_mul_poly }
+        WitnessTable { a_col, b_col, c_col, q_add, q_mul }
     }
 
     /// Computes the permuation layout.
@@ -280,88 +285,257 @@ pub struct PermutationArgument<F: Field> {
 }
 
 /// Represents the complete circuit.
-pub struct Circuit<F: Field> {
+pub struct Circuit<F: Field + FftField> {
     pub builder: CircuitBuilder<F>,
     pub witness: WitnessTable<F>,
     pub permutation: PermutationLayout,
     pub permutation_argument: Option<PermutationArgument<F>>,
+    pub domain: GeneralEvaluationDomain<F>,
 }
 
 impl<F: Field + ark_ff::FftField> Circuit<F> {
 
     /// Builds circuit using `CircuitBuilder`.
-    pub fn from_builder(builder: CircuitBuilder<F>) -> Self {
-        let witness = builder.generate_witness_table();
+    pub fn from_builder(builder: CircuitBuilder<F>, domain: GeneralEvaluationDomain<F>) -> Self {
+        let witness = builder.generate_witness_table(domain.size());
         let permutation = builder.compute_permutation_layout();
-        Self { builder, witness, permutation, permutation_argument: None }
+        Self { builder, witness, permutation, permutation_argument: None, domain }
     }
 
      /// Builds gate constraint polynomial.
     pub fn build_gate_constraint(&self) -> DensePolynomial<F> {
+        println!("a_col: {:?}", self.witness.a_col);
+        println!("b_col: {:?}", self.witness.b_col);
+        println!("c_col: {:?}", self.witness.c_col);
+        println!("q_add: {:?}", self.witness.q_add);
+        println!("q_mul: {:?}", self.witness.q_mul);
+        println!("a_col len: {}", self.witness.a_col.len());
+        println!("b_col len: {}", self.witness.b_col.len());
+        println!("c_col len: {}", self.witness.c_col.len());
+        println!("q_add len: {}", self.witness.q_add.len());
+        println!("q_mul len: {}", self.witness.q_mul.len());
+        println!("a_col first 5: {:?}", &self.witness.a_col[..5.min(self.witness.a_col.len())]);
+        println!("b_col first 5: {:?}", &self.witness.b_col[..5.min(self.witness.b_col.len())]);
+        println!("c_col first 5: {:?}", &self.witness.c_col[..5.min(self.witness.c_col.len())]);
+        println!("q_add first 5: {:?}", &self.witness.q_add[..5.min(self.witness.q_add.len())]);
+        println!("q_mul first 5: {:?}", &self.witness.q_mul[..5.min(self.witness.q_mul.len())]);
 
-        // interpolate to convert to polynomials
-        let a_poly = DensePolynomial::from_coefficients_vec(self.witness.a_col.clone());
-        let b_poly = DensePolynomial::from_coefficients_vec(self.witness.b_col.clone());
-        let c_poly = DensePolynomial::from_coefficients_vec(self.witness.c_col.clone());
-        let q_add_poly = self.witness.q_add_poly.clone();
-        let q_mul_poly = self.witness.q_mul_poly.clone();
-
-        // q_add * (A + B - C) + q_mul * (A * B - C) = 0
-        let add_expr = &q_add_poly * &(a_poly.clone() + b_poly.clone() - c_poly.clone());
-        let mul_expr = &q_mul_poly * &((a_poly.clone() * b_poly.clone()) - c_poly.clone());
-        add_expr + mul_expr
+        let n = self.witness.a_col.len();
+        let mut gate_vals = vec![F::zero(); n];
+        for i in 0..n {
+            let a = self.witness.a_col[i];
+            let b = self.witness.b_col[i];
+            let c = self.witness.c_col[i];
+            let q_add = self.witness.q_add[i];
+            let q_mul = self.witness.q_mul[i];
+            gate_vals[i] = q_add * (a + b - c) + q_mul * (a * b - c);
+        }
+        let gate_poly = DensePolynomial::from_coefficients_vec(self.domain.ifft(&gate_vals));
+        gate_poly
     }
 
     /// Builds permutation constraint polynomial.
-    pub fn build_permutation_constraint(&self, domain: GeneralEvaluationDomain<F>) -> DensePolynomial<F> {
+    pub fn build_permutation_constraint(
+        &self,
+        a_col_flat: &[F],
+        b_col_flat: &[F],
+        c_col_flat: &[F],
+        sigma: &[usize],
+    ) -> DensePolynomial<F> {
         let pa = self.permutation_argument.as_ref().expect("Permutation argument not set");
-        let a_col = &self.witness.a_col;
-        let b_col = &self.witness.b_col;
-        let c_col = &self.witness.c_col;
-        let n = a_col.len();
-        let mut lhs = vec![F::zero(); n];
-        let mut rhs = vec![F::zero(); n];
-
+        let n = self.domain.size();
+    
+        let mut constraint_vals = vec![F::zero(); n];
+    
         for i in 0..n {
-            let a_term = a_col[i] + pa.beta * pa.s_id_vals[i] + pa.gamma;
-            let b_term = b_col[i] + pa.beta * pa.s_id_vals[i] + pa.gamma;
-            let c_term = c_col[i] + pa.beta * pa.s_id_vals[i] + pa.gamma;
-            lhs[i] = pa.z_vals[i] * a_term * b_term * c_term;
+            let a = a_col_flat[i];
+            let b = b_col_flat[i];
+            let c = c_col_flat[i];
 
-            let a_perm = a_col[i] + pa.beta * pa.s_sigma_vals[i] + pa.gamma;
-            let b_perm = b_col[i] + pa.beta * pa.s_sigma_vals[i] + pa.gamma;
-            let c_perm = c_col[i] + pa.beta * pa.s_sigma_vals[i] + pa.gamma;
-            rhs[i] = pa.z_vals[(i + 1) % n] * a_perm * b_perm * c_perm;
+            // Use explicit wire indices for the identity permutation
+            let a_term = a + pa.beta * F::from(3 * i as u64) + pa.gamma;
+            let b_term = b + pa.beta * F::from(3 * i as u64 + 1) + pa.gamma;
+            let c_term = c + pa.beta * F::from(3 * i as u64 + 2) + pa.gamma;
+
+            // For sigma, use the s_id_vals at the sigma indices
+            let a_term_sigma = a + pa.beta * pa.s_id_vals[sigma[3 * i]] + pa.gamma;
+            let b_term_sigma = b + pa.beta * pa.s_id_vals[sigma[3 * i + 1]] + pa.gamma;
+            let c_term_sigma = c + pa.beta * pa.s_id_vals[sigma[3 * i + 2]] + pa.gamma;
+
+            if i < n - 1 {
+                // Standard permutation constraint
+                let lhs = pa.z_vals[i] * a_term * b_term * c_term;
+                let rhs = pa.z_vals[i + 1] * a_term_sigma * b_term_sigma * c_term_sigma;
+                constraint_vals[i] = lhs - rhs;
+            } else {
+                // Boundary condition: z[n] = 1, so we check that the last product equals 1
+                let product = a_term * b_term * c_term * (a_term_sigma * b_term_sigma * c_term_sigma).inverse().unwrap();
+                constraint_vals[i] = pa.z_vals[i] * product - F::one();
+            }
+
+            if i < 4 {
+                println!("Row {} debug:", i);
+                println!("  a: {}  b: {}  c: {}", a, b, c);
+                println!("  a_term: {} (index {})", a_term, 3 * i);
+                println!("  b_term: {} (index {})", b_term, 3 * i + 1);
+                println!("  c_term: {} (index {})", c_term, 3 * i + 2);
+                println!("  sigma indices: [{}, {}, {}]", sigma[3 * i], sigma[3 * i + 1], sigma[3 * i + 2]);
+                println!("  a_term_sigma: {} (index {})", a_term_sigma, sigma[3 * i]);
+                println!("  b_term_sigma: {} (index {})", b_term_sigma, sigma[3 * i + 1]);
+                println!("  c_term_sigma: {} (index {})", c_term_sigma, sigma[3 * i + 2]);
+                if i < n - 1 {
+                    let lhs = pa.z_vals[i] * a_term * b_term * c_term;
+                    let rhs = pa.z_vals[i + 1] * a_term_sigma * b_term_sigma * c_term_sigma;
+                    println!("  lhs: {}", lhs);
+                    println!("  rhs: {}", rhs);
+                    println!("  lhs - rhs = {}", lhs - rhs);
+                } else {
+                    let product = a_term * b_term * c_term * (a_term_sigma * b_term_sigma * c_term_sigma).inverse().unwrap();
+                    println!("  boundary constraint: {} * product - 1 = {}", pa.z_vals[i], pa.z_vals[i] * product - F::one());
+                }
+            }
         }
-
-        let evals: Vec<F> = lhs.iter().zip(rhs.iter()).map(|(l, r)| pa.alpha * (*l - *r)).collect();
-        DensePolynomial::from_coefficients_vec(domain.ifft(&evals))
+    
+        DensePolynomial::from_coefficients_vec(self.domain.ifft(&constraint_vals))
     }
+    
+    
 
-    /// Builds public input polynomial.
-    pub fn build_public_input_poly(&self, domain: GeneralEvaluationDomain<F>) -> DensePolynomial<F> {
+    /// Builds public input constraint polynomial: alpha * (wire_value - public_input)
+    pub fn build_public_input_poly(&self) -> DensePolynomial<F> {
         let pa = self.permutation_argument.as_ref().expect("Permutation argument not set");
         let a_vals = &self.witness.a_col;
         let public_inputs: Vec<F> = self.builder.public_inputs
             .iter()
             .map(|v| self.builder.variables[v.0].unwrap())
             .collect();
+        println!("public_inputs: {:?}", public_inputs);
+        println!("public_input indices: {:?}", self.builder.public_inputs.iter().map(|v| v.0).collect::<Vec<_>>());
         let mut constraint = vec![F::zero(); a_vals.len()];
-        for (i, pi) in public_inputs.iter().enumerate() {
-            constraint[i] = pa.alpha * (a_vals[i] - *pi);
+        for (pi_idx, var) in self.builder.public_inputs.iter().enumerate() {
+            let pi_value = self.builder.variables[var.0].unwrap();
+            // Find the first row where this variable is used as an input or output to a gate
+            let mut found_row = None;
+            for (row, gate) in self.builder.gates.iter().enumerate() {
+                if gate.inputs[0].0 == var.0 || gate.inputs[1].0 == var.0 || gate.output.0 == var.0 {
+                    found_row = Some(row);
+                    break;
+                }
+            }
+            if let Some(row) = found_row {
+                println!("Public input variable {} (value {}) mapped to row {}", var.0, pi_value, row);
+                constraint[row] = pa.alpha * (a_vals[row] - pi_value);
+            } else {
+                println!("Warning: public input variable {} not found in any gate input or output", var.0);
+            }
         }
-        DensePolynomial::from_coefficients_vec(domain.ifft(&constraint))
+        println!("public input constraint vector: {:?}", constraint);
+        DensePolynomial::from_coefficients_vec(self.domain.ifft(&constraint))
     }
 
     /// Builds the quotient polynomial.
-    pub fn build_quotient_polynomial(&self, domain: GeneralEvaluationDomain<F>) -> DensePolynomial<F> {
-        let gate_poly = self.build_gate_constraint();
-        let perm_poly = self.build_permutation_constraint(domain);
-        let pub_poly = self.build_public_input_poly(domain);
+    pub fn build_quotient_polynomial(&self, sigma: &[usize]) -> DensePolynomial<F> {
+        // Compute gate constraint values at each domain point (still use self.witness.a_col, etc. for gate domain)
+        let n = self.witness.a_col.len();
+        let mut gate_vals = vec![F::zero(); n];
+        for i in 0..n {
+            let a = self.witness.a_col[i];
+            let b = self.witness.b_col[i];
+            let c = self.witness.c_col[i];
+            let q_add = self.witness.q_add[i];
+            let q_mul = self.witness.q_mul[i];
+            gate_vals[i] = q_add * (a + b - c) + q_mul * (a * b - c);
+        }
+        let gate_poly = DensePolynomial::from_coefficients_vec(self.domain.ifft(&gate_vals));
 
-        let t_num = &gate_poly + &perm_poly + &pub_poly;
-        // For now, return the numerator polynomial as a placeholder
-        // TODO: Implement proper polynomial division with vanishing polynomial
-        t_num
+        // Compute permutation and public input constraint values at each domain point
+        let perm_poly = self.build_permutation_constraint(&self.witness.a_col, &self.witness.b_col, &self.witness.c_col, &sigma); // DensePolynomial<F>
+        let pub_poly = self.build_public_input_poly();       // DensePolynomial<F>
+        let perm_vals = self.domain.fft(&perm_poly.coeffs);
+        let pub_vals = self.domain.fft(&pub_poly.coeffs);
+
+        // Print all values and their sum at each domain point
+        println!("i | gate | perm | pub | sum");
+        for i in 0..n {
+            let sum = gate_vals[i] + perm_vals[i] + pub_vals[i];
+            println!("{:2} | {} | {} | {} | {}", i, gate_vals[i], perm_vals[i], pub_vals[i], sum);
+        }
+
+        let t_num = gate_poly.clone() + &perm_poly + &pub_poly;
+        println!("gate_poly degree: {}", gate_poly.degree());
+        println!("perm_poly degree: {}", perm_poly.degree());
+        println!("pub_poly degree: {}", pub_poly.degree());
+        println!("gate_poly first 5 coeffs: {:?}", &gate_poly.coeffs[..5.min(gate_poly.coeffs.len())]);
+        println!("perm_poly first 5 coeffs: {:?}", &perm_poly.coeffs[..5.min(perm_poly.coeffs.len())]);
+        println!("pub_poly first 5 coeffs: {:?}", &pub_poly.coeffs[..5.min(pub_poly.coeffs.len())]);
+        println!("t_num degree: {}", t_num.degree());
+        println!("t_num first 5 coeffs: {:?}", &t_num.coeffs[..5.min(t_num.coeffs.len())]);
+
+        let z_h: DensePolynomial<F> = self.domain.vanishing_polynomial().into();
+        let (t_quotient, remainder) = t_num.divide_by_vanishing_poly(self.domain);
+        if !remainder.is_zero() {
+            println!("Nonzero remainder: {:?}", remainder);
+            for (i, coeff) in remainder.coeffs.iter().enumerate() {
+                println!("  remainder coeff[{}] = {}", i, coeff);
+            }
+        }
+        assert!(remainder.is_zero(), "t(X) not divisible by Z_H(X)");
+        t_quotient
     }
+
+    pub fn build_grand_product(
+        witness_flat: &[F],
+        sigma: &[usize],
+        domain: GeneralEvaluationDomain<F>,
+        beta: F,
+        gamma: F,
+        s_id_vals: &[F],
+    ) -> DensePolynomial<F> {
+        let n = domain.size();
+        let mut z = vec![F::one(); n + 1];
+    
+        for i in 0..n {
+            // Flattened witness layout: [A_0, B_0, C_0, A_1, B_1, C_1, ...]
+            let a = witness_flat[3 * i];
+            let b = witness_flat[3 * i + 1];
+            let c = witness_flat[3 * i + 2];
+    
+            let a_sigma = witness_flat[sigma[3 * i]];
+            let b_sigma = witness_flat[sigma[3 * i + 1]];
+            let c_sigma = witness_flat[sigma[3 * i + 2]];
+    
+            let a_term = a + beta * s_id_vals[3 * i] + gamma;
+            let b_term = b + beta * s_id_vals[3 * i + 1] + gamma;
+            let c_term = c + beta * s_id_vals[3 * i + 2] + gamma;
+    
+            let a_term_sigma = a_sigma + beta * s_id_vals[sigma[3 * i]] + gamma;
+            let b_term_sigma = b_sigma + beta * s_id_vals[sigma[3 * i + 1]] + gamma;
+            let c_term_sigma = c_sigma + beta * s_id_vals[sigma[3 * i + 2]] + gamma;
+    
+            let numerator = a_term * b_term * c_term;
+            let denominator = a_term_sigma * b_term_sigma * c_term_sigma;
+    
+            z[i + 1] = z[i] * numerator * denominator.inverse().unwrap();
+
+            if i < 4 {
+                println!("Row {} debug:", i);
+                println!("  a: {}  b: {}  c: {}", a, b, c);
+                println!("  s_id_vals: [{}, {}, {}]", s_id_vals[3 * i], s_id_vals[3 * i + 1], s_id_vals[3 * i + 2]);
+                println!("  a_term: {} (s_id: {})", a_term, s_id_vals[3 * i]);
+                println!("  b_term: {} (s_id: {})", b_term, s_id_vals[3 * i + 1]);
+                println!("  c_term: {} (s_id: {})", c_term, s_id_vals[3 * i + 2]);
+                println!("  sigma indices: [{}, {}, {}]", sigma[3 * i], sigma[3 * i + 1], sigma[3 * i + 2]);
+                println!("  a_term_sigma: {} (sigma: {})", a_term_sigma, sigma[3 * i]);
+                println!("  b_term_sigma: {} (sigma: {})", b_term_sigma, sigma[3 * i + 1]);
+                println!("  c_term_sigma: {} (sigma: {})", c_term_sigma, sigma[3 * i + 2]);
+                println!("  lhs (z[i+1]): {}", z[i + 1]);
+                let rhs = z[i] * numerator * denominator.inverse().unwrap();
+                println!("  rhs (should match lhs): {}", rhs);
+                println!("  lhs - rhs = {}", z[i + 1] - rhs);
+            }
+        }
+    
+        DensePolynomial::from_coefficients_vec(domain.ifft(&z[..n].to_vec()))
+    }
+    
 }
