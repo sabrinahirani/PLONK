@@ -1,10 +1,9 @@
 use ark_bn254::{Bn254, Fr};
-use ark_ff::Field;
+use ark_ff::{Field, Zero};
 use ark_poly_commit::{
     marlin_pc::MarlinKZG10,
     PolynomialCommitment,
-    Commitment,
-    Proof,
+    LabeledCommitment,
 };
 use ark_poly::univariate::DensePolynomial;
 use ark_crypto_primitives::sponge::poseidon::{PoseidonSponge, PoseidonConfig};
@@ -16,7 +15,7 @@ use crate::prover::PlonkProof;
 
 // Type aliases for convenience
 type UniPoly = DensePolynomial<Fr>;
-type PCS = MarlinKZG10<Bn254, UniPoly, PoseidonSponge<Fr>>;
+type PCS = MarlinKZG10<Bn254, UniPoly>;
 pub type KZGVerifierKey = <PCS as PolynomialCommitment<Fr, UniPoly>>::VerifierKey;
 
 /// Create a test sponge for the MarlinKZG10 scheme
@@ -134,15 +133,15 @@ pub fn verify_plonk_proof(
     let mut sponge_t = test_sponge::<Fr>();
 
     // Create commitments for verification
-    let comms_a = vec![comm_a.clone()];
-    let comms_b = vec![comm_b.clone()];
-    let comms_c = vec![comm_c.clone()];
-    let comms_q_add = vec![comm_q_add.clone()];
-    let comms_q_mul = vec![comm_q_mul.clone()];
-    let comms_s_id = vec![comm_s_id.clone()];
-    let comms_s_sigma = vec![comm_s_sigma.clone()];
-    let comms_z = vec![comm_z.clone()];
-    let comms_t = vec![comm_t.clone()];
+    let comms_a = vec![LabeledCommitment::new("a".to_string(), comm_a.clone(), None)];
+    let comms_b = vec![LabeledCommitment::new("b".to_string(), comm_b.clone(), None)];
+    let comms_c = vec![LabeledCommitment::new("c".to_string(), comm_c.clone(), None)];
+    let comms_q_add = vec![LabeledCommitment::new("q_add".to_string(), comm_q_add.clone(), None)];
+    let comms_q_mul = vec![LabeledCommitment::new("q_mul".to_string(), comm_q_mul.clone(), None)];
+    let comms_s_id = vec![LabeledCommitment::new("s_id".to_string(), comm_s_id.clone(), None)];
+    let comms_s_sigma = vec![LabeledCommitment::new("s_sigma".to_string(), comm_s_sigma.clone(), None)];
+    let comms_z = vec![LabeledCommitment::new("z".to_string(), comm_z.clone(), None)];
+    let comms_t = vec![LabeledCommitment::new("t".to_string(), comm_t.clone(), None)];
 
     // Verify each proof using actual MarlinKZG10 verification
     PCS::check(&vk, &comms_a, &zeta, [a], &proof_a, &mut sponge_a, Some(&mut test_rng())).unwrap()

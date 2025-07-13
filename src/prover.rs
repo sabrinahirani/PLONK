@@ -8,8 +8,6 @@ use ark_poly_commit::{
     marlin_pc::MarlinKZG10,
     LabeledPolynomial,
     PolynomialCommitment,
-    Commitment,
-    Proof,
 };
 use ark_crypto_primitives::sponge::poseidon::{PoseidonSponge, PoseidonConfig};
 use ark_crypto_primitives::sponge::CryptographicSponge;
@@ -18,16 +16,17 @@ use ark_ff::UniformRand;
 use ark_std::rand::Rng;
 use ark_std::test_rng;
 
+use crate::circuit::{WireColumn, WirePosition, PermutationLayout};
+
 use ark_bn254::{Bn254, Fr};
 
 use ark_poly::DenseUVPolynomial;
-use ark_poly::UVPolynomial;
 
-// Type aliases for convenience
+// type aliases for convenience
 type UniPoly = DensePolynomial<Fr>;
-type PCS = MarlinKZG10<Bn254, UniPoly, PoseidonSponge<Fr>>;
-pub type KZGCommitment = Commitment<Bn254>;
-pub type KZGOpeningProof = Proof<Bn254>;
+type PCS = MarlinKZG10<Bn254, UniPoly>;
+pub type KZGCommitment = <PCS as PolynomialCommitment<Fr, UniPoly>>::Commitment;
+pub type KZGOpeningProof = <PCS as PolynomialCommitment<Fr, UniPoly>>::Proof;
 pub type KZGProverKey = <PCS as PolynomialCommitment<Fr, UniPoly>>::CommitterKey;
 pub type KZGVerifierKey = <PCS as PolynomialCommitment<Fr, UniPoly>>::VerifierKey;
 
@@ -57,204 +56,8 @@ fn test_sponge<F: ark_ff::PrimeField>() -> PoseidonSponge<F> {
     PoseidonSponge::new(&config)
 }
 
-// === Types for wiring and permutation ===
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum WireColumn {
-    A,
-    B,
-    C,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WirePosition {
-    pub col: WireColumn,
-    pub row: usize,
-}
-
-#[derive(Debug)]
-pub struct PermutationLayout {
-    pub positions: HashMap<usize, Vec<WirePosition>>, // Variable index → used positions
-}
-
-// === Wire flattening and sigma mapping ===
-
-pub fn flatten_wire_positions(num_rows: usize) -> Vec<WirePosition> {
-    let mut positions = Vec::with_capacity(3 * num_rows);
-    for row in 0..num_rows {
-        positions.push(WirePosition { col: WireColumn::A, row });
-        positions.push(WirePosition { col: WireColumn::B, row });
-        positions.push(WirePosition { col: WireColumn::C, row });
-    }
-    positions
-}
-
-pub fn compute_sigma_mapping(layout: &PermutationLayout, num_rows: usize) -> Vec<usize> {
-    let flat_positions = flatten_wire_positions(num_rows);
-    let mut sigma = vec![0usize; 3 * num_rows];
-
-    let mut position_to_index: HashMap<WirePosition, usize> = HashMap::new();
-    for (i, pos) in flat_positions.iter().enumerate() {
-        position_to_index.insert(*pos, i);
-    }
-
-    for (_var, uses) in layout.positions.iter() {
-        let n = uses.len();
-        for i in 0..n {
-            let from = uses[i];
-            let to = uses[(i + 1) % n];
-            let from_idx = position_to_index[&from];
-            let to_idx = position_to_index[&to];
-            sigma[from_idx] = to_idx;
-        }
-    }
-
-    sigma
-}
-
-// === Interpolate permutation polynomials ===
-
-pub fn interpolate_permutation_polynomials<F: Field + FftField>(
-    sigma: &[usize],
-) -> (DensePolynomial<F>, DensePolynomial<F>, GeneralEvaluationDomain<F>) {
-    let n = sigma.len();
-    let domain = GeneralEvaluationDomain::<F>::new(n).unwrap();
-
-    let s_id: Vec<F> = domain.elements().collect();
-    let s_sigma: Vec<F> = sigma.iter().map(|&i| domain.element(i)).collect();
-
-    let s_id_poly = DensePolynomial::from_coefficients_vec(domain.ifft(&s_id));
-    let s_sigma_poly = DensePolynomial::from_coefficients_vec(domain.ifft(&s_sigma));
-
-    (s_id_poly, s_sigma_poly, domain)
-}
-
-// === Compute Z(x) — Grand Product Polynomial ===
-
-pub fn compute_grand_product<F: Field + FftField>(
-    witness_flat: &[F],
-    sigma: &[usize],
-    domain: GeneralEvaluationDomain<F>,
-    beta: F,
-    gamma: F,
-) -> DensePolynomial<F> {
-    let n = witness_flat.len();
-    let omega_powers: Vec<F> = domain.elements().collect();
-    let s_id = &omega_powers;
-    let s_sigma: Vec<F> = sigma.iter().map(|&i| omega_powers[i]).collect();
-
-    let mut z_vals = vec![F::one(); n + 1];
-
-    for i in 0..n {
-        let num = witness_flat[i] + beta * s_id[i] + gamma;
-        let den = witness_flat[i] + beta * s_sigma[i] + gamma;
-        z_vals[i + 1] = z_vals[i] * num / den;
-    }
-
-    let z_vals = z_vals[..n].to_vec();
-    DensePolynomial::from_coefficients_vec(domain.ifft(&z_vals))
-}
-
-// === Constraint Building ===
-
-pub fn build_gate_constraint<F: Field>(
-    a: &DensePolynomial<F>,
-    b: &DensePolynomial<F>,
-    c: &DensePolynomial<F>,
-    q_add: &DensePolynomial<F>,
-    q_mul: &DensePolynomial<F>,
-) -> DensePolynomial<F> {
-    let add_expr = q_add * &(a.clone() + b.clone() - c.clone());
-    let mul_expr = q_mul * &((a.clone() * b.clone()) - c.clone());
-    add_expr + mul_expr
-}
-
-pub fn build_permutation_constraint<F: Field + FftField>(
-    a_vals: &[F],
-    b_vals: &[F],
-    c_vals: &[F],
-    s_id_vals: &[F],
-    s_sigma_vals: &[F],
-    z_vals: &[F],
-    beta: F,
-    gamma: F,
-    alpha: F,
-    domain: GeneralEvaluationDomain<F>,
-) -> DensePolynomial<F> {
-    let n = a_vals.len();
-    let mut lhs = vec![F::zero(); n];
-    let mut rhs = vec![F::zero(); n];
-
-    for i in 0..n {
-        let a_term = a_vals[i] + beta * s_id_vals[i] + gamma;
-        let b_term = b_vals[i] + beta * s_id_vals[i] + gamma;
-        let c_term = c_vals[i] + beta * s_id_vals[i] + gamma;
-        lhs[i] = z_vals[i] * a_term * b_term * c_term;
-
-        let a_perm = a_vals[i] + beta * s_sigma_vals[i] + gamma;
-        let b_perm = b_vals[i] + beta * s_sigma_vals[i] + gamma;
-        let c_perm = c_vals[i] + beta * s_sigma_vals[i] + gamma;
-        rhs[i] = z_vals[(i + 1) % n] * a_perm * b_perm * c_perm;
-    }
-
-    let evals: Vec<F> = lhs.iter().zip(rhs.iter()).map(|(l, r)| alpha * (*l - *r)).collect();
-    DensePolynomial::from_coefficients_vec(domain.ifft(&evals))
-}
-
-pub fn build_public_input_poly<F: Field + FftField>(
-    a_vals: &[F],
-    public_inputs: &[F],
-    alpha: F,
-    domain: GeneralEvaluationDomain<F>,
-) -> DensePolynomial<F> {
-    let mut constraint = vec![F::zero(); a_vals.len()];
-    for (i, pi) in public_inputs.iter().enumerate() {
-        constraint[i] = alpha * (a_vals[i] - *pi);
-    }
-    DensePolynomial::from_coefficients_vec(domain.ifft(&constraint))
-}
-
-// === Quotient Polynomial ===
-
-pub fn build_quotient_polynomial<F: FftField>(
-    a_poly: &DensePolynomial<F>,
-    b_poly: &DensePolynomial<F>,
-    c_poly: &DensePolynomial<F>,
-    q_add: &DensePolynomial<F>,
-    q_mul: &DensePolynomial<F>,
-    s_id_vals: &[F],
-    s_sigma_vals: &[F],
-    z_vals: &[F],
-    a_vals: &[F],
-    b_vals: &[F],
-    c_vals: &[F],
-    public_inputs: &[F],
-    beta: F,
-    gamma: F,
-    alpha: F,
-    domain: GeneralEvaluationDomain<F>,
-) -> DensePolynomial<F> {
-    let gate_poly = build_gate_constraint(a_poly, b_poly, c_poly, q_add, q_mul);
-    let perm_poly = build_permutation_constraint(
-        a_vals, b_vals, c_vals,
-        s_id_vals, s_sigma_vals,
-        z_vals, beta, gamma, alpha, domain,
-    );
-    let pub_poly = build_public_input_poly(a_vals, public_inputs, alpha, domain);
-
-    let t_num = &gate_poly + &perm_poly + pub_poly.clone();
-
-    let z_h = domain.vanishing_polynomial().into();
-
-    let (t_quot, rem) = t_num.divide_with_q_and_r(&z_h).unwrap();
-    assert!(rem.is_zero(), "Quotient division remainder not zero");
-
-    t_quot
-}
-
-// === Evaluation and Proof Struct ===
-
 pub struct PlonkProof<F: Field> {
+
     // Evaluations at zeta:
     pub eval_a: F,
     pub eval_b: F,
@@ -346,15 +149,15 @@ pub fn create_plonk_proof<R: Rng>(
     let (comms_z, states_z) = PCS::commit(pk, [&labeled_z], Some(rng)).unwrap();
     let (comms_t, states_t) = PCS::commit(pk, [&labeled_t], Some(rng)).unwrap();
 
-    let comm_a = comms_a[0].clone();
-    let comm_b = comms_b[0].clone();
-    let comm_c = comms_c[0].clone();
-    let comm_q_add = comms_q_add[0].clone();
-    let comm_q_mul = comms_q_mul[0].clone();
-    let comm_s_id = comms_s_id[0].clone();
-    let comm_s_sigma = comms_s_sigma[0].clone();
-    let comm_z = comms_z[0].clone();
-    let comm_t = comms_t[0].clone();
+    let comm_a = comms_a[0].commitment().clone();
+    let comm_b = comms_b[0].commitment().clone();
+    let comm_c = comms_c[0].commitment().clone();
+    let comm_q_add = comms_q_add[0].commitment().clone();
+    let comm_q_mul = comms_q_mul[0].commitment().clone();
+    let comm_s_id = comms_s_id[0].commitment().clone();
+    let comm_s_sigma = comms_s_sigma[0].commitment().clone();
+    let comm_z = comms_z[0].commitment().clone();
+    let comm_t = comms_t[0].commitment().clone();
 
     // Open polynomials at zeta, unpacking evaluation + proof
     let eval_a = a.evaluate(&zeta);
