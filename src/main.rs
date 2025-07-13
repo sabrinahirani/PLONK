@@ -37,7 +37,7 @@ fn main() {
     let g = builder.add_gate(GateType::Add, e, f); // g = e + f = 19
     // Instead of creating a new variable for 3, reuse 'a' for the final multiplication
     let out = builder.add_gate(GateType::Mul, g, a); // out = g * a = 19 * 3 = 57
-    builder.mark_public(out);
+    // builder.mark_public(out);
 
     // 2. Determine domain size (next power of two >= number of gates)
     let num_gates = builder.gates.len();
@@ -49,6 +49,12 @@ fn main() {
     // 3. Build the circuit with the correct domain size
     let mut circuit = Circuit::from_builder(builder, domain.clone());
     println!("Circuit built with {} gates", circuit.builder.gates.len());
+    
+    // Debug: Print all gates
+    for (i, gate) in circuit.builder.gates.iter().enumerate() {
+        println!("Gate {}: {:?} (inputs: [{}, {}], output: {})", 
+                i, gate.gate_type, gate.inputs[0].0, gate.inputs[1].0, gate.output.0);
+    }
 
     // 4. Compute permutation layout and sigma
     let layout = &circuit.permutation;

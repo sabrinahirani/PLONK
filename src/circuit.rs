@@ -220,10 +220,13 @@ impl<F: Field + ark_ff::FftField> CircuitBuilder<F> {
         let mut q_add = Vec::new();
         let mut q_mul = Vec::new();
 
-        for gate in &self.gates {
+        for (i, gate) in self.gates.iter().enumerate() {
             let a = self.variables[gate.inputs[0].0].unwrap();
             let b = self.variables[gate.inputs[1].0].unwrap();
             let c = self.variables[gate.output.0].unwrap();
+
+            println!("Witness generation row {}: gate_type={:?}, inputs=[{}, {}], output={}, a={}, b={}, c={}", 
+                    i, gate.gate_type, gate.inputs[0].0, gate.inputs[1].0, gate.output.0, a, b, c);
 
             a_col.push(a);
             b_col.push(b);
@@ -233,10 +236,12 @@ impl<F: Field + ark_ff::FftField> CircuitBuilder<F> {
                 GateType::Add => {
                     q_add.push(F::one());
                     q_mul.push(F::zero());
+                    println!("  -> q_add=1, q_mul=0");
                 }
                 GateType::Mul => {
                     q_add.push(F::zero());
                     q_mul.push(F::one());
+                    println!("  -> q_add=0, q_mul=1");
                 }
             }
         }
