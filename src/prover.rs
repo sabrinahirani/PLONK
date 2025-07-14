@@ -15,8 +15,10 @@ use ark_ec::pairing::Pairing;
 use ark_ff::UniformRand;
 use ark_std::rand::Rng;
 use ark_std::test_rng;
+use ark_serialize::CanonicalSerialize;
 
 use crate::circuit::{WireColumn, WirePosition, PermutationLayout};
+use crate::transcript::{PlonkTranscript, absorb_public_inputs};
 
 use ark_bn254::{Bn254, Fr};
 
@@ -113,7 +115,8 @@ pub fn evaluate_polynomials_at_zeta<F: Field>(
     )
 }
 
-pub fn create_plonk_proof<R: Rng>(
+/// Create a PLONK proof using non-interactive challenge generation via Fiat-Shamir
+pub fn create_plonk_proof_with_transcript<R: Rng>(
     pk: &KZGProverKey,
     a: &DensePolynomial<Fr>,
     b: &DensePolynomial<Fr>,
@@ -122,12 +125,19 @@ pub fn create_plonk_proof<R: Rng>(
     q_mul: &DensePolynomial<Fr>,
     s_id: &DensePolynomial<Fr>,
     s_sigma: &DensePolynomial<Fr>,
-    z: &DensePolynomial<Fr>,
-    t: &DensePolynomial<Fr>,
-    zeta: Fr,
+    public_inputs: &[Fr],
+    witness_flat: &[Fr],
+    sigma: &[usize],
+    domain: &ark_poly::GeneralEvaluationDomain<Fr>,
     rng: &mut R,
 ) -> PlonkProof<Fr> {
-    // Create labeled polynomials
+    // Initialize transcript
+    let mut transcript = PlonkTranscript::new(b"plonk_proof");
+    
+    // Absorb public inputs first
+    absorb_public_inputs(transcript.inner(), public_inputs);
+    
+    // Create labeled polynomials for selector and witness polynomials
     let labeled_a = LabeledPolynomial::new("a".to_string(), a.clone(), None, Some(1));
     let labeled_b = LabeledPolynomial::new("b".to_string(), b.clone(), None, Some(1));
     let labeled_c = LabeledPolynomial::new("c".to_string(), c.clone(), None, Some(1));
@@ -135,10 +145,8 @@ pub fn create_plonk_proof<R: Rng>(
     let labeled_q_mul = LabeledPolynomial::new("q_mul".to_string(), q_mul.clone(), None, Some(1));
     let labeled_s_id = LabeledPolynomial::new("s_id".to_string(), s_id.clone(), None, Some(1));
     let labeled_s_sigma = LabeledPolynomial::new("s_sigma".to_string(), s_sigma.clone(), None, Some(1));
-    let labeled_z = LabeledPolynomial::new("z".to_string(), z.clone(), None, Some(1));
-    let labeled_t = LabeledPolynomial::new("t".to_string(), t.clone(), None, Some(1));
 
-    // Commit to polynomials
+    // Commit to selector and witness polynomials first
     let (comms_a, states_a) = PCS::commit(pk, [&labeled_a], Some(rng)).unwrap();
     let (comms_b, states_b) = PCS::commit(pk, [&labeled_b], Some(rng)).unwrap();
     let (comms_c, states_c) = PCS::commit(pk, [&labeled_c], Some(rng)).unwrap();
@@ -146,8 +154,6 @@ pub fn create_plonk_proof<R: Rng>(
     let (comms_q_mul, states_q_mul) = PCS::commit(pk, [&labeled_q_mul], Some(rng)).unwrap();
     let (comms_s_id, states_s_id) = PCS::commit(pk, [&labeled_s_id], Some(rng)).unwrap();
     let (comms_s_sigma, states_s_sigma) = PCS::commit(pk, [&labeled_s_sigma], Some(rng)).unwrap();
-    let (comms_z, states_z) = PCS::commit(pk, [&labeled_z], Some(rng)).unwrap();
-    let (comms_t, states_t) = PCS::commit(pk, [&labeled_t], Some(rng)).unwrap();
 
     let comm_a = comms_a[0].commitment().clone();
     let comm_b = comms_b[0].commitment().clone();
@@ -156,8 +162,105 @@ pub fn create_plonk_proof<R: Rng>(
     let comm_q_mul = comms_q_mul[0].commitment().clone();
     let comm_s_id = comms_s_id[0].commitment().clone();
     let comm_s_sigma = comms_s_sigma[0].commitment().clone();
+
+    // Absorb commitments into transcript in the correct order
+    // Use raw transcript methods to avoid trait bound issues
+    let mut buf = Vec::new();
+    comm_q_add.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"q_add", &buf);
+    
+    let mut buf = Vec::new();
+    comm_q_mul.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"q_mul", &buf);
+    
+    let mut buf = Vec::new();
+    comm_a.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"a", &buf);
+    
+    let mut buf = Vec::new();
+    comm_b.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"b", &buf);
+    
+    let mut buf = Vec::new();
+    comm_c.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"c", &buf);
+    
+    let mut buf = Vec::new();
+    comm_s_id.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"s_id", &buf);
+    
+    let mut buf = Vec::new();
+    comm_s_sigma.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"s_sigma", &buf);
+
+    // Derive beta and gamma challenges for permutation argument
+    let beta = transcript.challenge_beta::<Fr>();
+    let gamma = transcript.challenge_gamma::<Fr>();
+
+    println!("=== Fiat-Shamir Challenges ===");
+    println!("beta: {}", beta);
+    println!("gamma: {}", gamma);
+
+    // Now compute the grand product polynomial using the derived challenges
+    let s_id_vals: Vec<Fr> = (0..3 * domain.size()).map(|i| Fr::from(i as u64)).collect();
+    let z_poly = crate::circuit::Circuit::<Fr>::build_grand_product(witness_flat, sigma, domain.clone(), beta, gamma, &s_id_vals);
+    
+    // Commit to the grand product polynomial
+    let labeled_z = LabeledPolynomial::new("z".to_string(), z_poly.clone(), None, Some(1));
+    let (comms_z, states_z) = PCS::commit(pk, [&labeled_z], Some(rng)).unwrap();
     let comm_z = comms_z[0].commitment().clone();
+    
+    // Absorb grand product commitment
+    let mut buf = Vec::new();
+    comm_z.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"z", &buf);
+
+    // Derive alpha challenge for quotient polynomial
+    let alpha = transcript.challenge_alpha::<Fr>();
+    println!("alpha: {}", alpha);
+
+    // Now compute the quotient polynomial using all the derived challenges
+    // We need to create a temporary circuit to compute the quotient polynomial
+    let mut temp_circuit = crate::circuit::Circuit::<Fr>::from_builder(
+        crate::circuit::CircuitBuilder::<Fr>::new(), 
+        domain.clone()
+    );
+    temp_circuit.witness = crate::circuit::WitnessTable {
+        a_col: a.coeffs.clone(),
+        b_col: b.coeffs.clone(),
+        c_col: c.coeffs.clone(),
+        q_add: domain.fft(&q_add.coeffs),
+        q_mul: domain.fft(&q_mul.coeffs),
+    };
+    
+    // Set the permutation argument with the derived challenges
+    let z_vals = domain.fft(&z_poly.coeffs);
+    temp_circuit.permutation_argument = Some(crate::circuit::PermutationArgument {
+        s_id_vals,
+        s_sigma_vals: (0..3 * domain.size()).map(|i| s_sigma.evaluate(&domain.element(i))).collect(),
+        z_vals,
+        beta,
+        gamma,
+        alpha,
+    });
+    
+    // Compute the quotient polynomial
+    let t_poly = temp_circuit.build_quotient_polynomial(sigma);
+    println!("Quotient polynomial degree: {}", t_poly.degree());
+
+    // Commit to quotient polynomial
+    let labeled_t = LabeledPolynomial::new("t".to_string(), t_poly.clone(), None, Some(1));
+    let (comms_t, states_t) = PCS::commit(pk, [&labeled_t], Some(rng)).unwrap();
     let comm_t = comms_t[0].commitment().clone();
+    
+    // Absorb quotient commitment
+    let mut buf = Vec::new();
+    comm_t.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"t", &buf);
+
+    // Derive zeta challenge for evaluation point
+    let zeta = transcript.challenge_zeta::<Fr>();
+    println!("zeta: {}", zeta);
 
     // Open polynomials at zeta, unpacking evaluation + proof
     let eval_a = a.evaluate(&zeta);
@@ -167,8 +270,16 @@ pub fn create_plonk_proof<R: Rng>(
     let eval_q_mul = q_mul.evaluate(&zeta);
     let eval_s_id = s_id.evaluate(&zeta);
     let eval_s_sigma = s_sigma.evaluate(&zeta);
-    let eval_z = z.evaluate(&zeta);
-    let eval_t = t.evaluate(&zeta);
+    let eval_z = z_poly.evaluate(&zeta);
+    let eval_t = t_poly.evaluate(&zeta);
+
+    // Absorb evaluations into transcript
+    transcript.absorb_evaluations(
+        &eval_a, &eval_b, &eval_c,
+        &eval_q_add, &eval_q_mul,
+        &eval_s_id, &eval_s_sigma,
+        &eval_z, &eval_t,
+    );
 
     // Create opening proofs using actual MarlinKZG10
     let mut sponge_a = test_sponge::<Fr>();

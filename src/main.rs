@@ -12,8 +12,8 @@ use ark_std::test_rng;
 use ark_ff::{UniformRand, Field, FftField, Zero};
 use circuit::{CircuitBuilder, GateType, Circuit, PermutationArgument};
 use poly_utils::interpolate_permutation_polynomials;
-use prover::create_plonk_proof;
-use verifier::verify_plonk_proof;
+use prover::create_plonk_proof_with_transcript;
+use verifier::verify_plonk_proof_with_transcript;
 use ark_poly::{DenseUVPolynomial, EvaluationDomain};
 use ark_poly_commit::PolynomialCommitment;
 use ark_poly::Polynomial;
@@ -92,16 +92,6 @@ fn main() {
     println!("s_id_vals len: {} first 5: {:?}", s_id_vals.len(), &s_id_vals[..5.min(s_id_vals.len())]);
     println!("s_sigma_vals len: {} first 5: {:?}", s_sigma_vals.len(), &s_sigma_vals[..5.min(s_sigma_vals.len())]);
 
-    // === Sample challenge values ===
-    let beta = Fr::rand(rng);
-    let gamma = Fr::rand(rng);
-    let alpha = Fr::rand(rng);
-
-    println!("Sampled challenges:");
-    println!("   (beta):   {}", beta);
-    println!("   (gamma):  {}", gamma);
-    println!("   (alpha):  {}", alpha);
-
     // === Flatten witness and compute grand product ===
     let mut witness_flat = circuit.witness.flatten();
     // Pad witness_flat to 3 * domain.size() (not permutation_domain.size())
@@ -129,13 +119,7 @@ fn main() {
     assert_eq!(s_id_vals.len(), 3 * domain.size(), "s_id_vals length mismatch");
     assert_eq!(s_sigma_vals.len(), 3 * domain.size(), "s_sigma_vals length mismatch");
 
-    let z_poly = Circuit::<Fr>::build_grand_product(&witness_flat, &sigma_for_grand_product, domain, beta, gamma, &s_id_vals);
-    println!("z_poly degree: {}", z_poly.degree());
-
-    // z_vals should have length n (domain.size()), not 3*n
-    let z_vals = domain.fft(&z_poly.coeffs);
-    assert_eq!(z_vals.len(), domain.size(), "z_vals length mismatch");
-    println!("z_vals len: {} first 5: {:?}", z_vals.len(), &z_vals[..5.min(z_vals.len())]);
+    // Note: The grand product polynomial (z_poly) will be computed in the prover using transcript-derived challenges
 
     // === Detailed wire-by-wire debug analysis ===
     println!("\n=== Wire-by-Wire Analysis ===");
@@ -148,6 +132,9 @@ fn main() {
             let w_val = witness_flat[3*row + wire_idx];
             let s_val = s_id_vals[3*row + wire_idx];
             let sigma_val = sigma_for_grand_product[3*row + wire_idx];
+            // Note: We'll use actual challenges from transcript later
+            let beta = Fr::rand(rng); // Placeholder
+            let gamma = Fr::rand(rng); // Placeholder
             let num_factor = w_val + beta * s_val + gamma;
             let den_factor = w_val + beta * Fr::from(sigma_val as u64) + gamma;
             
@@ -177,88 +164,77 @@ fn main() {
     println!("Sigma mapping: {:?}", sigma_for_grand_product);
     println!("Expected ordering: [A_0, B_0, C_0, A_1, B_1, C_1, A_2, B_2, C_2, A_3, B_3, C_3]");
 
+    // Note: We'll set the permutation argument later when we have challenges from transcript
+    // For now, use placeholder values
+    let z_vals_placeholder: Vec<Fr> = (0..domain.size()).map(|_| Fr::one()).collect();
     circuit.permutation_argument = Some(PermutationArgument {
         s_id_vals,
         s_sigma_vals,
-        z_vals,
-        beta,
-        gamma,
-        alpha,
+        z_vals: z_vals_placeholder,
+        beta: Fr::rand(rng), // Placeholder
+        gamma: Fr::rand(rng), // Placeholder
+        alpha: Fr::rand(rng), // Placeholder
     });
 
-    // === 3. Build quotient polynomial ===
-    let t_poly = circuit.build_quotient_polynomial(&sigma_for_grand_product);
-    println!("Quotient polynomial degree: {}", t_poly.degree());
-
-    let zeta = Fr::rand(rng);
-    let z_h_eval = domain.evaluate_vanishing_polynomial(zeta);
-    println!("zeta: {}", zeta);
-    println!("Z_H(zeta): {}", z_h_eval);
+    // Note: The quotient polynomial will be computed in the prover using transcript-derived challenges
 
     // === 4. Setup PCS (KZG) ===
     let pp = PCS::setup(max_degree, None, rng).unwrap();
     let (pk, vk) = PCS::trim(&pp, max_degree, 1, None).unwrap();
     println!("PCS setup complete.");
 
-    // === 5. Prove ===
+    // === 5. Create polynomials for proof generation ===
     let a_poly = DensePolynomial::from_coefficients_vec(circuit.witness.a_col.clone());
     let b_poly = DensePolynomial::from_coefficients_vec(circuit.witness.b_col.clone());
     let c_poly = DensePolynomial::from_coefficients_vec(circuit.witness.c_col.clone());
     let q_add_poly = DensePolynomial::from_coefficients_vec(domain.ifft(&circuit.witness.q_add));
     let q_mul_poly = DensePolynomial::from_coefficients_vec(domain.ifft(&circuit.witness.q_mul));
 
-    println!("a_poly: {:?}", a_poly);
-    println!("b_poly: {:?}", b_poly);
-    println!("c_poly: {:?}", c_poly);
-    println!("q_add_poly: {:?}", q_add_poly);
-    println!("q_mul_poly: {:?}", q_mul_poly);
+    println!("Polynomial degrees:");
+    println!("  a_poly: {}", a_poly.degree());
+    println!("  b_poly: {}", b_poly.degree());
+    println!("  c_poly: {}", c_poly.degree());
+    println!("  q_add_poly: {}", q_add_poly.degree());
+    println!("  q_mul_poly: {}", q_mul_poly.degree());
+    println!("  s_id_poly: {}", s_id_poly.degree());
+    println!("  s_sigma_poly: {}", s_sigma_poly.degree());
 
-    let proof = create_plonk_proof(
-        &pk,
-        &a_poly, &b_poly, &c_poly,
-        &q_add_poly, &q_mul_poly,
-        &s_id_poly, &s_sigma_poly,
-        &z_poly, &t_poly,
-        zeta,
-        rng,
-    );
-    println!("Proof created.");
-
-    // === 6. Verify ===
+    // Get public inputs
     let public_inputs: Vec<Fr> = circuit.builder.public_inputs
         .iter()
         .map(|v| circuit.builder.variables[v.0].unwrap())
         .collect();
     println!("Public inputs: {:?}", public_inputs);
 
-    let is_valid = verify_plonk_proof(
+    // === 6. Prove using transcript-based proof generation ===
+    println!("\n=== Generating PLONK Proof ===");
+    let proof = create_plonk_proof_with_transcript(
+        &pk,
+        &a_poly, &b_poly, &c_poly,
+        &q_add_poly, &q_mul_poly,
+        &s_id_poly, &s_sigma_poly,
+        &public_inputs,
+        &witness_flat,
+        &sigma_for_grand_product,
+        &domain,
+        rng,
+    );
+    println!("✅ Proof created using transcript-based generation.");
+
+    // === 7. Verify using transcript-based verification ===
+    println!("\n=== Verifying PLONK Proof ===");
+    let is_valid = verify_plonk_proof_with_transcript(
         &vk,
         &proof,
         &public_inputs,
-        beta, gamma, alpha,
-        zeta,
-        z_h_eval,
     );
 
-    println!("PLONK proof is valid: {}", is_valid);
+    println!("🎉 PLONK proof verification result: {}", is_valid);
 
-    println!("Full sigma vector:");
-    for (i, s) in sigma_for_grand_product.iter().enumerate() {
-        println!("  sigma_for_grand_product[{}] = {}", i, s);
-    }
-    let domain_elems: Vec<_> = domain.elements().collect();
-    println!("Full domain elements (for domain size {}):", domain.size());
-    for (i, d) in domain_elems.iter().enumerate() {
-        println!("  domain[{}] = {}", i, d);
-    }
-    println!("Wire position to index mapping:");
-    let mut flat_positions = Vec::with_capacity(3 * domain.size());
-    for row in 0..domain.size() {
-        flat_positions.push(("A", row));
-        flat_positions.push(("B", row));
-        flat_positions.push(("C", row));
-    }
-    for (i, (col, row)) in flat_positions.iter().enumerate() {
-        println!("  index {}: col {} row {}", i, col, row);
-    }
+    println!("\n=== Summary ===");
+    println!("Circuit gates: {}", circuit.builder.gates.len());
+    println!("Domain size: {}", domain.size());
+    println!("Public inputs: {}", public_inputs.len());
+    println!("Proof generated: ✅");
+    println!("Proof verified: {}", if is_valid { "✅" } else { "❌" });
 }

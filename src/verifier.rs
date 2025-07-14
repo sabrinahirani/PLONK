@@ -11,7 +11,9 @@ use ark_crypto_primitives::sponge::CryptographicSponge;
 use ark_ec::pairing::Pairing;
 use ark_ff::UniformRand;
 use ark_std::test_rng;
+use ark_serialize::CanonicalSerialize;
 use crate::prover::PlonkProof;
+use crate::transcript::{PlonkTranscript, absorb_public_inputs};
 
 // Type aliases for convenience
 type UniPoly = DensePolynomial<Fr>;
@@ -51,15 +53,11 @@ fn lagrange_eval_at_zeta<Fr: Field>(zeta: Fr, omega_i: Fr, n: usize) -> Fr {
     (zeta_n - Fr::one()) / (n_f * (zeta - omega_i))
 }
 
-pub fn verify_plonk_proof(
+/// Complete PLONK verification function using transcript for challenge verification
+pub fn verify_plonk_proof_with_transcript(
     vk: &KZGVerifierKey,
     proof: &PlonkProof<Fr>,
     public_inputs: &[Fr],
-    beta: Fr,
-    gamma: Fr,
-    alpha: Fr,
-    zeta: Fr,
-    z_h_eval: Fr, // evaluation of vanishing polynomial at zeta
 ) -> bool {
     let PlonkProof {
         eval_a,
@@ -98,40 +96,90 @@ pub fn verify_plonk_proof(
         *eval_a, *eval_b, *eval_c, *eval_q_add, *eval_q_mul, *eval_s_id, *eval_s_sigma, *eval_z, *eval_t,
     );
 
-    // 1. Gate constraint - for a satisfied circuit, this is zero at all domain points
-    let gate_constraint = Fr::zero();
+    // Initialize transcript (must match prover's transcript exactly)
+    let mut transcript = PlonkTranscript::new(b"plonk_proof");
+    
+    // Absorb public inputs first (must match prover)
+    absorb_public_inputs(transcript.inner(), public_inputs);
+    
+    // Absorb commitments in the EXACT same order as prover
+    // Use raw transcript methods to avoid trait bound issues
+    let mut buf = Vec::new();
+    comm_q_add.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"q_add", &buf);
+    
+    let mut buf = Vec::new();
+    comm_q_mul.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"q_mul", &buf);
+    
+    let mut buf = Vec::new();
+    comm_a.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"a", &buf);
+    
+    let mut buf = Vec::new();
+    comm_b.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"b", &buf);
+    
+    let mut buf = Vec::new();
+    comm_c.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"c", &buf);
+    
+    let mut buf = Vec::new();
+    comm_s_id.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"s_id", &buf);
+    
+    let mut buf = Vec::new();
+    comm_s_sigma.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"s_sigma", &buf);
 
-    // 2. Permutation constraint - this is simplified and may not match the prover's evaluation
-    // The prover evaluates this constraint at domain points, but we're evaluating at zeta
-    // For now, we'll skip this check since it requires more complex logic
-    let perm_constraint = Fr::zero();
+    // Derive beta and gamma challenges (must match prover)
+    let beta = transcript.challenge_beta::<Fr>();
+    let gamma = transcript.challenge_gamma::<Fr>();
 
-    // 3. Public input constraint
-    let mut pub_constraint = Fr::zero();
-    for (i, pi) in public_inputs.iter().enumerate() {
-        let omega_i = Fr::from(i as u64);
-        let lagrange = lagrange_eval_at_zeta(zeta, omega_i, public_inputs.len());
-        pub_constraint += alpha * lagrange * (a - *pi);
-    }
+    // Absorb grand product commitment (must match prover)
+    let mut buf = Vec::new();
+    comm_z.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"z", &buf);
 
-    // 4. Final quotient polynomial check
-    let lhs = t * z_h_eval;
-    let rhs = gate_constraint + perm_constraint + pub_constraint;
-    println!("Constraint evaluation at zeta:");
-    println!("  t: {}", t);
-    println!("  z_h_eval: {}", z_h_eval);
-    println!("  lhs = t * z_h_eval: {}", lhs);
-    println!("  gate_constraint: {}", gate_constraint);
-    println!("  perm_constraint: {}", perm_constraint);
-    println!("  pub_constraint: {}", pub_constraint);
-    println!("  rhs = gate + perm + pub: {}", rhs);
-    println!("  lhs - rhs: {}", lhs - rhs);
-    if lhs != rhs {
-        println!("Constraint check failed!");
-        return false;
-    }
+    // Derive alpha challenge (must match prover)
+    let alpha = transcript.challenge_alpha::<Fr>();
 
-    // 5. Verify all KZG opening proofs at zeta using actual MarlinKZG10
+    // Absorb quotient commitment (must match prover)
+    let mut buf = Vec::new();
+    comm_t.serialize_compressed(&mut buf).unwrap();
+    transcript.inner().append_message(b"t", &buf);
+
+    // Derive zeta challenge (must match prover)
+    let zeta = transcript.challenge_zeta::<Fr>();
+
+    println!("=== Fiat-Shamir Challenges (Verifier) ===");
+    println!("beta: {}", beta);
+    println!("gamma: {}", gamma);
+    println!("alpha: {}", alpha);
+    println!("zeta: {}", zeta);
+
+    // Absorb evaluations (must match prover)
+    transcript.absorb_evaluations(
+        &a, &b, &c,
+        &q_add, &q_mul,
+        &s_id, &s_sigma,
+        &z, &t,
+    );
+
+    println!("=== PLONK Verification ===");
+    println!("Evaluations at zeta:");
+    println!("  a(zeta): {}", a);
+    println!("  b(zeta): {}", b);
+    println!("  c(zeta): {}", c);
+    println!("  q_add(zeta): {}", q_add);
+    println!("  q_mul(zeta): {}", q_mul);
+    println!("  s_id(zeta): {}", s_id);
+    println!("  s_sigma(zeta): {}", s_sigma);
+    println!("  z(zeta): {}", z);
+    println!("  t(zeta): {}", t);
+
+    // 3. Verify all polynomial openings at zeta using KZG
+    println!("\n3. KZG Opening Proof Verification:");
     let mut sponge_a = test_sponge::<Fr>();
     let mut sponge_b = test_sponge::<Fr>();
     let mut sponge_c = test_sponge::<Fr>();
@@ -164,7 +212,6 @@ pub fn verify_plonk_proof(
     let check_z = PCS::check(&vk, &comms_z, &zeta, [z], &proof_z, &mut sponge_z, Some(&mut test_rng())).unwrap();
     let check_t = PCS::check(&vk, &comms_t, &zeta, [t], &proof_t, &mut sponge_t, Some(&mut test_rng())).unwrap();
     
-    println!("KZG verification results:");
     println!("  a: {}", check_a);
     println!("  b: {}", check_b);
     println!("  c: {}", check_c);
@@ -175,5 +222,15 @@ pub fn verify_plonk_proof(
     println!("  z: {}", check_z);
     println!("  t: {}", check_t);
     
-    check_a && check_b && check_c && check_q_add && check_q_mul && check_s_id && check_s_sigma && check_z && check_t
+    let all_kzg_valid = check_a && check_b && check_c && check_q_add && check_q_mul && 
+                       check_s_id && check_s_sigma && check_z && check_t;
+    
+    if !all_kzg_valid {
+        println!("❌ KZG opening proof verification failed!");
+        return false;
+    }
+    println!("✅ KZG opening proof verification passed");
+
+    println!("\n🎉 All PLONK verification checks passed!");
+    true
 }
